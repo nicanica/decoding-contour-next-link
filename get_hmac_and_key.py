@@ -3,7 +3,7 @@
 import requests # pip install requests
 import binascii
 import javaobj
-import StringIO
+import io
 import struct
 import sys
 import getpass
@@ -11,13 +11,15 @@ import argparse
 import logging # To make javaobj's logger be quiet
 import sqlite3
 import re
+import hashlib
+
 logging.disable( logging.CRITICAL )
 
-from read_minimed_next24 import Config, MedtronicMachine
+from read_minimed_next24 import Config, Medtronic600SeriesDriver
 
 class CareLinkRequest( javaobj.JavaObjectMarshaller ):
     def __init__( self ):
-        self.object_stream = StringIO.StringIO()
+        self.object_stream = io.StringIO()
         self._writeStreamHeader()
 
 class CareLinkKeyRequest( CareLinkRequest ):
@@ -27,11 +29,19 @@ class CareLinkKeyRequest( CareLinkRequest ):
         return self.object_stream.getvalue()
 
     def decodeResponse( self, data ):
-        decoder = javaobj.JavaObjectUnmarshaller( StringIO.StringIO( data ) )
+        decoder = javaobj.JavaObjectUnmarshaller( io.StringIO( data ) )
         int1 = struct.unpack( '>I', decoder.readObject() )[0]
-        keyArray = decoder.readObject()
-        key = ''.join('{:02x}'.format( x & 0xff ) for x in keyArray )
-        count = struct.unpack( '>I', decoder.readObject() )[0]
+        # If int1 is 16, then we have valid data in the following object. If it's 0,
+        # then no data follows
+        print "INT RESPONSE: {0}".format( int1 )
+        if int1 > 0:
+            keyArray = decoder.readObject()
+            key = ''.join('{:02x}'.format( x & 0xff ) for x in keyArray )
+            count = struct.unpack( '>I', decoder.readObject() )[0]
+            print "COUNT: {0}".format( count )
+        else:
+            key = None
+            count = 0
         return ( int1, key, count )
 
     def post( self, longSerial, session ):
@@ -39,11 +49,12 @@ class CareLinkKeyRequest( CareLinkRequest ):
 
         response = session.post( 'https://carelink.minimed.eu/patient/main/../secure/SnapshotServer/',
             headers = { 'Content-Type': 'application/octet-stream' },
-            stream = True,
             data = data
         )
 
-        return self.decodeResponse( response.raw.read() )
+        print "Status code: {0}".format( response.status_code )
+        print binascii.hexlify( response.content )
+        return self.decodeResponse( response.content )
 
 class CareLinkHMACRequest( CareLinkRequest ):
     def buildRequest( self, serial ):
@@ -52,7 +63,7 @@ class CareLinkHMACRequest( CareLinkRequest ):
         return self.object_stream.getvalue()
 
     def decodeResponse( self, data ):
-        decoder = javaobj.JavaObjectUnmarshaller( StringIO.StringIO( data ) )
+        decoder = javaobj.JavaObjectUnmarshaller( io.StringIO( data ) )
         hmacArray = decoder.readObject()
         hmac = ''.join('{:02x}'.format( x & 0xff ) for x in reversed(hmacArray) )
         return hmac
@@ -62,15 +73,20 @@ class CareLinkHMACRequest( CareLinkRequest ):
 
         response = session.post( 'https://carelink.minimed.eu/patient/main/../secure/SnapshotServer/',
             headers = { 'Content-Type': 'application/octet-stream' },
-            stream = True,
             data = data
         )
 
-        return self.decodeResponse( response.raw.read() )
+        return self.decodeResponse( response.content )
+
+def getHmac( serial ):
+    paddingKey = "A4BD6CED9A42602564F413123"
+    digest = hashlib.sha256(serial + paddingKey).hexdigest()
+    return "".join(reversed([digest[i:i+2] for i in range(0, len(digest), 2)]))
 
 def getHmacAndKey( config, serial, longSerial, session ):
-    request = CareLinkHMACRequest()
-    hmac = request.post( serial, session )
+    #request = CareLinkHMACRequest()
+    #hmac = request.post( serial, session )
+    hmac = getHmac( serial )
 
     request = CareLinkKeyRequest()
     ( int1, key, count ) = request.post( longSerial, session )
@@ -113,14 +129,15 @@ if __name__ == '__main__':
                 getHmacAndKey( config, serial, longSerial, session )
         else:
             try:
-                mt = MedtronicMachine()
-                mt.initDevice()
+                mt = Medtronic600SeriesDriver()
+                mt.openDevice()
                 mt.getDeviceInfo()
 
+                print (mt.deviceSerial)
                 if mt.deviceSerial == None:
                     raise Exception()
             except Exception:
-                print "Please plug in your Contour NextLink 2.4, and rerun this script"
+                print ("Please plug in your Contour NextLink 2.4, and rerun this script")
                 sys.exit( 1 )
 
             longSerial = str( mt.deviceSerial )
